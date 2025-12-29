@@ -293,6 +293,61 @@ which script
 # Should output: /usr/bin/script
 ```
 
+## Web Server
+
+A Flask-based web server for browsing session logs over Tailscale.
+
+### Starting the Server
+
+**Manual:**
+```bash
+python3 ~/claude-log-server.py --port 8090
+```
+
+**As a systemd service:**
+```bash
+# Create service file
+sudo tee /etc/systemd/system/claude-log-server.service << 'EOF'
+[Unit]
+Description=Claude Session Log Server
+After=network.target
+
+[Service]
+Type=simple
+User=graeme
+ExecStart=/usr/bin/python3 /home/graeme/claude-log-server.py --port 8090
+Restart=on-failure
+
+[Install]
+WantedBy=multi-user.target
+EOF
+
+# Enable and start
+sudo systemctl daemon-reload
+sudo systemctl enable claude-log-server
+sudo systemctl start claude-log-server
+```
+
+### Features
+
+- Index page groups sessions by name
+- Shows log count, latest date, file sizes
+- On-demand HTML conversion with color preservation
+- Serves pre-converted HTML files (for captured scrollback)
+- `/raw/<filename>` endpoint for raw log access
+
+### Capturing Old Sessions
+
+For sessions started without logging, capture from tmux scrollback:
+
+```bash
+# Capture with ANSI colors
+tmux capture-pane -t SESSION_NAME -p -e -S - -E - > ~/claude-logs/name_YYYYMMDD_HHMMSS.log
+
+# Convert to HTML with aha
+cat ~/claude-logs/name_YYYYMMDD_HHMMSS.log | aha --black > ~/claude-logs/name_YYYYMMDD_HHMMSS.html
+```
+
 ## Dependencies
 
 | Package | Purpose | Install |
@@ -300,6 +355,8 @@ which script
 | `tmux` | Session persistence | `apt install tmux` |
 | `script` | Terminal recording | Part of `util-linux` |
 | `pyte` | Terminal emulation | `pip3 install pyte` |
+| `flask` | Web server | `pip3 install flask` |
+| `aha` | ANSI to HTML (scrollback) | `apt install aha` |
 
 ## License
 
