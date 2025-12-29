@@ -334,14 +334,19 @@ start_logged_session() {
     fi
     printf "\n"
 
-    # Trap to handle script cleanup (Ctrl-C passes through to claude)
-    # We use exec so script inherits our process, signals go to it naturally
-
-    # Start logging with script, then exec into claude
+    # Start logging with script, then run claude
     # -q: quiet (don't print start/end messages to terminal)
     # -f: flush after each write (real-time logging)
-    # When claude exits, script exits, and the terminal returns cleanly
-    exec script -q -f "$log_file" -c "$claude_cmd"
+    script -q -f "$log_file" -c "$claude_cmd"
+
+    # After session ends, generate HTML version of the log
+    printf "\n"
+    print_info "Session ended. Generating HTML log..."
+    if python3 "${HOME}/claude-log-clean.py" "$log_file" "${log_file%.log}.html" 2>/dev/null; then
+        print_success "HTML log: ${log_file%.log}.html"
+    else
+        print_warning "HTML generation failed (log file saved)"
+    fi
 }
 
 run_in_tmux() {

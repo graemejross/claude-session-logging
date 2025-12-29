@@ -75,7 +75,7 @@ def format_size(size):
 
 
 def convert_log_to_html(logfile):
-    """Convert log to HTML, preferring pre-converted files."""
+    """Convert log to HTML, preferring fresh pre-converted files."""
     log_path = LOG_DIR / logfile
     html_path = LOG_DIR / logfile.replace('.log', '.html')
 
@@ -83,8 +83,12 @@ def convert_log_to_html(logfile):
         return None
 
     # Check for pre-converted HTML file (for captured scrollback sessions)
+    # Only use if HTML is newer than log (i.e., generated after log was finalized)
     if html_path.exists():
-        return html_path.read_text()
+        html_mtime = html_path.stat().st_mtime
+        log_mtime = log_path.stat().st_mtime
+        if html_mtime >= log_mtime:
+            return html_path.read_text()
 
     # Check cache
     mtime = log_path.stat().st_mtime
