@@ -40,15 +40,15 @@ NC='\033[0m' # No Color
 #------------------------------------------------------------------------------
 
 print_info() {
-    printf "${BLUE}▶${NC} %s\n" "$1"
+    printf "${BLUE}▶${NC} %s\n" "$1" >/dev/tty
 }
 
 print_success() {
-    printf "${GREEN}✓${NC} %s\n" "$1"
+    printf "${GREEN}✓${NC} %s\n" "$1" >/dev/tty
 }
 
 print_warning() {
-    printf "${YELLOW}⚠${NC} %s\n" "$1"
+    printf "${YELLOW}⚠${NC} %s\n" "$1" >/dev/tty
 }
 
 print_error() {
@@ -132,8 +132,8 @@ sanitize_name() {
 prompt_session_name() {
     local name=""
     while [ -z "$name" ]; do
-        printf "${BLUE}Enter session name:${NC} "
-        read -r name
+        printf "${BLUE}Enter session name:${NC} " >/dev/tty
+        read -r name </dev/tty
         if [ -z "$name" ]; then
             print_warning "Session name cannot be empty"
         fi
