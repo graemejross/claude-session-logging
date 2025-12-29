@@ -17,9 +17,9 @@
 #   3. The user gets a consistent experience regardless of starting context
 #
 # Usage:
-#   claude-session [session-name]    Start a logged Claude session
-#   claude-session --list            Show recent session logs
-#   claude-session --help            Show this help
+#   claude-session [session-name] [-- claude-options]    Start a logged Claude session
+#   claude-session --list                                Show recent session logs
+#   claude-session --help                                Show this help
 #
 
 set -e
@@ -57,21 +57,27 @@ print_error() {
 
 show_help() {
     cat <<EOF
-Usage: ${SCRIPT_NAME} [OPTIONS] [session-name]
+Usage: ${SCRIPT_NAME} [OPTIONS] [session-name] [-- claude-options...]
 
 Manage logged Claude Code sessions within TMUX.
 
 Arguments:
   session-name    Optional name for the session (prompted if not provided)
+  claude-options  Options to pass through to claude (after --)
 
 Options:
   --list, -l      Show recent session logs from ~/claude-logs
   --help, -h      Show this help message
 
 Examples:
-  ${SCRIPT_NAME}                    # Prompt for session name
-  ${SCRIPT_NAME} "bug fix"          # Start session named "bug_fix"
-  ${SCRIPT_NAME} --list             # Show recent logs
+  ${SCRIPT_NAME}                           # Prompt for name and options
+  ${SCRIPT_NAME} "bug fix"                 # Interactive options menu
+  ${SCRIPT_NAME} "review" -- --resume      # Resume last conversation
+  ${SCRIPT_NAME} "quick" -- --model haiku  # Use haiku model (skip menu)
+  ${SCRIPT_NAME} --list                    # Show recent logs
+
+If no claude-options are provided, an interactive menu lets you choose
+common options like resume, model selection, and verbose mode.
 
 Log files are saved to: ${LOG_DIR}/
 
@@ -135,6 +141,151 @@ prompt_session_name() {
     echo "$name"
 }
 
+prompt_claude_options() {
+    # Interactive menu for selecting claude options with arrow key navigation
+    # Returns selected options, one per line
+    local selected_opts=()
+
+    printf "\n${BLUE}━━━ Claude Session Options ━━━${NC}\n\n" >/dev/tty
+
+    # Question 1: Session Type
+    local session_type
+    session_type=$(select_option "Session Type" \
+        "New conversation|Start a fresh conversation" \
+        "Resume recent|Continue your most recent conversation (--continue)" \
+        "Resume specific|Pick from previous sessions (--resume)")
+
+    case "$session_type" in
+        1) ;; # New conversation - no flag needed
+        2) selected_opts+=("--continue") ;;
+        3) selected_opts+=("--resume") ;;
+    esac
+
+    # Question 2: Model Selection
+    # Get available models from claude help
+    local model_choice
+    model_choice=$(select_option "Model" \
+        "Sonnet|Balanced speed and capability (default)" \
+        "Opus|Most capable, best for complex tasks" \
+        "Haiku|Fastest, ideal for quick simple tasks")
+
+    case "$model_choice" in
+        1) ;; # Sonnet is default, no flag needed
+        2) selected_opts+=("--model"); selected_opts+=("opus") ;;
+        3) selected_opts+=("--model"); selected_opts+=("haiku") ;;
+    esac
+
+    # Question 3: Verbose Mode
+    local verbose_choice
+    verbose_choice=$(select_option "Verbose Output" \
+        "Normal|Standard output (default)" \
+        "Verbose|Show detailed tool calls and debug info (--verbose)")
+
+    case "$verbose_choice" in
+        2) selected_opts+=("--verbose") ;;
+    esac
+
+    # Question 4: Permission Mode
+    local perm_choice
+    perm_choice=$(select_option "Permission Mode" \
+        "Default|Ask for permission on sensitive operations (default)" \
+        "Accept Edits|Auto-approve file edits, ask for others" \
+        "Plan Mode|Start in planning mode, no auto-execution" \
+        "Skip All|Bypass all permission checks (--dangerously-skip-permissions)")
+
+    case "$perm_choice" in
+        2) selected_opts+=("--permission-mode"); selected_opts+=("acceptEdits") ;;
+        3) selected_opts+=("--permission-mode"); selected_opts+=("plan") ;;
+        4) selected_opts+=("--dangerously-skip-permissions") ;;
+    esac
+
+    # Output the selected options
+    if [ ${#selected_opts[@]} -gt 0 ]; then
+        printf '%s\n' "${selected_opts[@]}"
+    fi
+}
+
+select_option() {
+    # Arrow-key navigable selection menu
+    # Usage: select_option "Question" "Option1|Description1" "Option2|Description2" ...
+    # Returns: 1-based index of selected option
+    # All display output goes to /dev/tty, only the result goes to stdout
+
+    local question="$1"
+    shift
+    local options=("$@")
+    local num_options=${#options[@]}
+    local selected=0  # 0-indexed, first option is default
+
+    # Hide cursor
+    printf '\e[?25l' >/dev/tty
+
+    # Trap to restore cursor on exit
+    trap 'printf "\e[?25h" >/dev/tty' RETURN
+
+    while true; do
+        # Print question
+        printf "\r\e[K${BLUE}%s:${NC}\n" "$question" >/dev/tty
+
+        # Print options
+        for i in "${!options[@]}"; do
+            local opt="${options[$i]}"
+            local label="${opt%%|*}"
+            local desc="${opt#*|}"
+
+            if [ "$i" -eq "$selected" ]; then
+                printf "\e[K  ${GREEN}▸ %-18s${NC} ${YELLOW}%s${NC}\n" "$label" "$desc" >/dev/tty
+            else
+                printf "\e[K    %-18s ${YELLOW}%s${NC}\n" "$label" "$desc" >/dev/tty
+            fi
+        done
+
+        # Print navigation hint
+        printf "\e[K  ${BLUE}↑/↓${NC} navigate  ${BLUE}Enter${NC} select\n" >/dev/tty
+
+        # Read key from tty
+        local key
+        IFS= read -rsn1 key </dev/tty
+
+        if [[ "$key" == $'\e' ]]; then
+            # Escape sequence - read more
+            read -rsn2 -t 0.1 key </dev/tty
+            case "$key" in
+                '[A') # Up arrow
+                    ((selected = (selected - 1 + num_options) % num_options))
+                    ;;
+                '[B') # Down arrow
+                    ((selected = (selected + 1) % num_options))
+                    ;;
+            esac
+        elif [[ "$key" == "" ]]; then
+            # Enter pressed
+            break
+        fi
+
+        # Move cursor back up to redraw
+        printf "\e[%dA" $((num_options + 2)) >/dev/tty
+    done
+
+    # Show cursor
+    printf '\e[?25h' >/dev/tty
+
+    # Clear the menu area
+    printf "\e[%dA" $((num_options + 2)) >/dev/tty
+    for ((i = 0; i < num_options + 2; i++)); do
+        printf "\e[K\n" >/dev/tty
+    done
+    printf "\e[%dA" $((num_options + 2)) >/dev/tty
+
+    # Print final selection
+    local final_opt="${options[$selected]}"
+    local final_label="${final_opt%%|*}"
+    printf "${BLUE}%s:${NC} ${GREEN}%s${NC}\n" "$question" "$final_label" >/dev/tty
+
+    # Return 1-based index (only this goes to stdout)
+    echo $((selected + 1))
+}
+
 ensure_log_dir() {
     if [ ! -d "$LOG_DIR" ]; then
         mkdir -p "$LOG_DIR"
@@ -148,6 +299,8 @@ ensure_log_dir() {
 
 start_logged_session() {
     local session_name="$1"
+    shift
+    local claude_opts=("$@")
     local sanitized_name
     local timestamp
     local log_file
@@ -165,10 +318,20 @@ start_logged_session() {
     # Ensure log directory exists
     ensure_log_dir
 
+    # Build claude command with options
+    local claude_cmd="claude"
+    if [ ${#claude_opts[@]} -gt 0 ]; then
+        # Properly quote options for passing to script -c
+        claude_cmd="claude $(printf '%q ' "${claude_opts[@]}")"
+    fi
+
     # Print session info
     printf "\n"
     print_success "Starting Claude session: ${session_name}"
     print_info "Log file: ${log_file}"
+    if [ ${#claude_opts[@]} -gt 0 ]; then
+        print_info "Claude options: ${claude_opts[*]}"
+    fi
     printf "\n"
 
     # Trap to handle script cleanup (Ctrl-C passes through to claude)
@@ -178,11 +341,13 @@ start_logged_session() {
     # -q: quiet (don't print start/end messages to terminal)
     # -f: flush after each write (real-time logging)
     # When claude exits, script exits, and the terminal returns cleanly
-    exec script -q -f "$log_file" -c "claude"
+    exec script -q -f "$log_file" -c "$claude_cmd"
 }
 
 run_in_tmux() {
     local session_name="$1"
+    shift
+    local claude_opts=("$@")
     local sanitized_name
     local tmux_session_name
 
@@ -211,8 +376,12 @@ run_in_tmux() {
 
     # Create new TMUX session running this script again
     # The re-invoked script will detect TMUX and start logging directly
-    # We pass the session name so it doesn't prompt again
-    exec tmux new-session -s "$tmux_session_name" "$0" "$session_name"
+    # We pass the session name and claude options (with -- separator)
+    if [ ${#claude_opts[@]} -gt 0 ]; then
+        exec tmux new-session -s "$tmux_session_name" "$0" "$session_name" -- "${claude_opts[@]}"
+    else
+        exec tmux new-session -s "$tmux_session_name" "$0" "$session_name"
+    fi
 }
 
 #------------------------------------------------------------------------------
@@ -236,6 +405,24 @@ main() {
     local session_name="${1:-}"
     if [ -z "$session_name" ]; then
         session_name=$(prompt_session_name)
+    else
+        shift
+    fi
+
+    # Parse claude options (everything after --)
+    local claude_opts=()
+    local has_explicit_opts=false
+    if [ "${1:-}" = "--" ]; then
+        shift
+        claude_opts=("$@")
+        has_explicit_opts=true
+    fi
+
+    # If no options provided and not inside TMUX, show interactive menu
+    # (Only prompt once, before entering TMUX)
+    if [ "$has_explicit_opts" = false ] && [ -z "${TMUX:-}" ]; then
+        # Read options from prompt into array
+        mapfile -t claude_opts < <(prompt_claude_options)
     fi
 
     # Check if we're inside TMUX
@@ -245,11 +432,11 @@ main() {
         # This is either:
         #   a) User ran script from within an existing TMUX session
         #   b) We created a TMUX session that re-invoked this script
-        start_logged_session "$session_name"
+        start_logged_session "$session_name" "${claude_opts[@]}"
     else
         # Outside TMUX: create a TMUX session that runs this script
         # This ensures logging happens inside TMUX for session persistence
-        run_in_tmux "$session_name"
+        run_in_tmux "$session_name" "${claude_opts[@]}"
     fi
 }
 
