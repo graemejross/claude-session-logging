@@ -1,0 +1,256 @@
+#!/bin/bash
+#
+# claude-session - Manage logged Claude Code sessions within TMUX
+#
+# This script provides automatic logging of Claude Code sessions using the
+# `script` command inside TMUX. It handles the complexity of ensuring logging
+# happens correctly whether invoked from inside or outside TMUX.
+#
+# TMUX Nesting Avoidance Strategy:
+# ================================
+# When run outside TMUX, we create a new TMUX session that re-invokes this
+# same script. The re-invoked script detects it's now inside TMUX (via the
+# TMUX environment variable) and proceeds to start logging + claude directly,
+# rather than creating another TMUX session. This two-phase approach ensures:
+#   1. Logging always happens inside TMUX (for session persistence)
+#   2. We never accidentally nest TMUX sessions
+#   3. The user gets a consistent experience regardless of starting context
+#
+# Usage:
+#   claude-session [session-name]    Start a logged Claude session
+#   claude-session --list            Show recent session logs
+#   claude-session --help            Show this help
+#
+
+set -e
+
+# Configuration
+LOG_DIR="${HOME}/claude-logs"
+SCRIPT_NAME="$(basename "$0")"
+
+# Colors for output
+RED='\033[0;31m'
+GREEN='\033[0;32m'
+YELLOW='\033[0;33m'
+BLUE='\033[0;34m'
+NC='\033[0m' # No Color
+
+#------------------------------------------------------------------------------
+# Helper Functions
+#------------------------------------------------------------------------------
+
+print_info() {
+    printf "${BLUE}▶${NC} %s\n" "$1"
+}
+
+print_success() {
+    printf "${GREEN}✓${NC} %s\n" "$1"
+}
+
+print_warning() {
+    printf "${YELLOW}⚠${NC} %s\n" "$1"
+}
+
+print_error() {
+    printf "${RED}✗${NC} %s\n" "$1" >&2
+}
+
+show_help() {
+    cat <<EOF
+Usage: ${SCRIPT_NAME} [OPTIONS] [session-name]
+
+Manage logged Claude Code sessions within TMUX.
+
+Arguments:
+  session-name    Optional name for the session (prompted if not provided)
+
+Options:
+  --list, -l      Show recent session logs from ~/claude-logs
+  --help, -h      Show this help message
+
+Examples:
+  ${SCRIPT_NAME}                    # Prompt for session name
+  ${SCRIPT_NAME} "bug fix"          # Start session named "bug_fix"
+  ${SCRIPT_NAME} --list             # Show recent logs
+
+Log files are saved to: ${LOG_DIR}/
+
+To convert logs to HTML (requires 'aha'):
+  claude-log-html <logfile>
+
+EOF
+}
+
+show_recent_logs() {
+    if [ ! -d "$LOG_DIR" ]; then
+        print_warning "No log directory found at ${LOG_DIR}"
+        exit 0
+    fi
+
+    local log_count
+    log_count=$(find "$LOG_DIR" -maxdepth 1 -name "*.log" -type f 2>/dev/null | wc -l)
+
+    if [ "$log_count" -eq 0 ]; then
+        print_warning "No session logs found in ${LOG_DIR}"
+        exit 0
+    fi
+
+    printf "${BLUE}Recent Claude sessions:${NC}\n\n"
+    printf "%-45s %10s  %s\n" "SESSION" "SIZE" "DATE"
+    printf "%s\n" "$(printf '%.0s-' {1..75})"
+
+    # List logs sorted by modification time (newest first)
+    # Format: filename, size, date
+    find "$LOG_DIR" -maxdepth 1 -name "*.log" -type f -printf "%T@ %p\n" 2>/dev/null \
+        | sort -rn \
+        | head -20 \
+        | while read -r _ filepath; do
+            filename=$(basename "$filepath")
+            # Extract session name (everything before the timestamp)
+            session_name="${filename%_[0-9]*_[0-9]*.log}"
+            size=$(du -h "$filepath" 2>/dev/null | cut -f1)
+            date=$(stat -c "%y" "$filepath" 2>/dev/null | cut -d'.' -f1)
+            printf "%-45s %10s  %s\n" "$session_name" "$size" "$date"
+        done
+
+    printf "\n${BLUE}Log directory:${NC} %s\n" "$LOG_DIR"
+    printf "${BLUE}Total logs:${NC} %s\n" "$log_count"
+}
+
+sanitize_name() {
+    # Replace spaces with underscores, remove special chars except dash/underscore
+    # Convert to lowercase for consistency
+    echo "$1" | tr '[:upper:]' '[:lower:]' | tr ' ' '_' | tr -cd 'a-z0-9_-'
+}
+
+prompt_session_name() {
+    local name=""
+    while [ -z "$name" ]; do
+        printf "${BLUE}Enter session name:${NC} "
+        read -r name
+        if [ -z "$name" ]; then
+            print_warning "Session name cannot be empty"
+        fi
+    done
+    echo "$name"
+}
+
+ensure_log_dir() {
+    if [ ! -d "$LOG_DIR" ]; then
+        mkdir -p "$LOG_DIR"
+        print_success "Created log directory: ${LOG_DIR}"
+    fi
+}
+
+#------------------------------------------------------------------------------
+# Main Session Logic
+#------------------------------------------------------------------------------
+
+start_logged_session() {
+    local session_name="$1"
+    local sanitized_name
+    local timestamp
+    local log_file
+
+    # Sanitize the session name for use as filename
+    sanitized_name=$(sanitize_name "$session_name")
+    if [ -z "$sanitized_name" ]; then
+        sanitized_name="session"
+    fi
+
+    # Generate timestamp and log file path
+    timestamp=$(date +"%Y%m%d_%H%M%S")
+    log_file="${LOG_DIR}/${sanitized_name}_${timestamp}.log"
+
+    # Ensure log directory exists
+    ensure_log_dir
+
+    # Print session info
+    printf "\n"
+    print_success "Starting Claude session: ${session_name}"
+    print_info "Log file: ${log_file}"
+    printf "\n"
+
+    # Trap to handle script cleanup (Ctrl-C passes through to claude)
+    # We use exec so script inherits our process, signals go to it naturally
+
+    # Start logging with script, then exec into claude
+    # -q: quiet (don't print start/end messages to terminal)
+    # -f: flush after each write (real-time logging)
+    # When claude exits, script exits, and the terminal returns cleanly
+    exec script -q -f "$log_file" -c "claude"
+}
+
+run_in_tmux() {
+    local session_name="$1"
+    local sanitized_name
+    local tmux_session_name
+
+    sanitized_name=$(sanitize_name "$session_name")
+    if [ -z "$sanitized_name" ]; then
+        sanitized_name="session"
+    fi
+    tmux_session_name="claude-${sanitized_name}"
+
+    # Check if this TMUX session already exists
+    if tmux has-session -t "$tmux_session_name" 2>/dev/null; then
+        print_warning "TMUX session '${tmux_session_name}' already exists"
+        printf "Attach to it? [Y/n] "
+        read -r response
+        case "$response" in
+            [nN]*)
+                exit 0
+                ;;
+            *)
+                exec tmux attach-session -t "$tmux_session_name"
+                ;;
+        esac
+    fi
+
+    print_info "Creating TMUX session: ${tmux_session_name}"
+
+    # Create new TMUX session running this script again
+    # The re-invoked script will detect TMUX and start logging directly
+    # We pass the session name so it doesn't prompt again
+    exec tmux new-session -s "$tmux_session_name" "$0" "$session_name"
+}
+
+#------------------------------------------------------------------------------
+# Entry Point
+#------------------------------------------------------------------------------
+
+main() {
+    # Parse arguments
+    case "${1:-}" in
+        --help|-h)
+            show_help
+            exit 0
+            ;;
+        --list|-l)
+            show_recent_logs
+            exit 0
+            ;;
+    esac
+
+    # Get session name (from argument or prompt)
+    local session_name="${1:-}"
+    if [ -z "$session_name" ]; then
+        session_name=$(prompt_session_name)
+    fi
+
+    # Check if we're inside TMUX
+    # TMUX env var is set when inside a TMUX session
+    if [ -n "${TMUX:-}" ]; then
+        # Inside TMUX: start logging and run claude directly
+        # This is either:
+        #   a) User ran script from within an existing TMUX session
+        #   b) We created a TMUX session that re-invoked this script
+        start_logged_session "$session_name"
+    else
+        # Outside TMUX: create a TMUX session that runs this script
+        # This ensures logging happens inside TMUX for session persistence
+        run_in_tmux "$session_name"
+    fi
+}
+
+main "$@"
