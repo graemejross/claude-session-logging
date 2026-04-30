@@ -25,8 +25,37 @@ from flask import Flask, Response, abort, request
 
 app = Flask(__name__)
 
-LOG_DIR = Path.home() / "claude-logs"
+LOG_DIRS: list[Path] = [Path.home() / "claude-logs"]  # overridden in main() via --dir
 CLEAN_SCRIPT = Path.home() / "claude-log-clean.py"
+
+
+def log_dir_for(filename):
+    """Return the LOG_DIR containing this filename, or LOG_DIRS[0] as fallback."""
+    for d in LOG_DIRS:
+        if (d / filename).exists():
+            return d
+    return LOG_DIRS[0]
+
+
+def find_log_path(filename):
+    """Find a log file across all LOG_DIRS. Returns Path or None."""
+    for d in LOG_DIRS:
+        p = d / filename
+        if p.exists():
+            return p
+    return None
+
+
+def iter_log_files(pattern):
+    """Yield matching log files across all existing LOG_DIRS."""
+    for d in LOG_DIRS:
+        if d.exists():
+            yield from d.glob(pattern)
+
+
+def any_log_dir_exists():
+    return any(d.exists() for d in LOG_DIRS)
+
 
 # Cache for converted HTML (in-memory, cleared on restart)
 html_cache = {}
@@ -61,7 +90,7 @@ def is_session_active(logfile_name):
     if logfile_name.endswith(".gz"):
         return False
 
-    pid_file = LOG_DIR / (logfile_name + ".converter-pid")
+    pid_file = log_dir_for(logfile_name) / (logfile_name + ".converter-pid")
     if not pid_file.exists():
         return False
 
@@ -78,7 +107,7 @@ def html_age(logfile_name):
     base = logfile_name
     if base.endswith(".gz"):
         base = base[:-3]
-    html_path = LOG_DIR / base.replace(".log", ".html")
+    html_path = log_dir_for(logfile_name) / base.replace(".log", ".html")
     if html_path.exists():
         age_secs = time.time() - html_path.stat().st_mtime
         if age_secs < 60:
@@ -96,12 +125,12 @@ def get_sessions():
     """Get list of sessions grouped by name with their logs."""
     sessions = {}
 
-    if not LOG_DIR.exists():
+    if not any_log_dir_exists():
         return sessions
 
-    # Collect both .log and .log.gz files
+    # Collect both .log and .log.gz files across all configured dirs
     for pattern in ["*.log", "*.log.gz"]:
-        for logfile in LOG_DIR.glob(pattern):
+        for logfile in iter_log_files(pattern):
             name, timestamp = parse_log_filename(logfile.name)
             size = logfile.stat().st_size
             active = is_session_active(logfile.name)
@@ -141,8 +170,8 @@ def format_size(size):
 
 def read_log_content(logfile):
     """Read log file content, handling both plain and gzipped files."""
-    log_path = LOG_DIR / logfile
-    if not log_path.exists():
+    log_path = find_log_path(logfile)
+    if log_path is None:
         return None
 
     if logfile.endswith(".gz"):
@@ -159,8 +188,10 @@ def convert_log_to_html(logfile):
     if base_logfile.endswith(".gz"):
         base_logfile = base_logfile[:-3]
 
-    log_path = LOG_DIR / logfile
-    html_path = LOG_DIR / base_logfile.replace(".log", ".html")
+    log_path = find_log_path(logfile)
+    if log_path is None:
+        return None
+    html_path = log_path.parent / base_logfile.replace(".log", ".html")
 
     if not log_path.exists():
         return None
@@ -491,10 +522,10 @@ def search():
     max_results = 100
     count = 0
 
-    if LOG_DIR.exists():
-        # Search .log files (plain text)
+    if any_log_dir_exists():
+        # Search .log files (plain text) across all configured dirs
         for logfile in sorted(
-            LOG_DIR.glob("*.log"), key=lambda p: p.stat().st_mtime, reverse=True
+            iter_log_files("*.log"), key=lambda p: p.stat().st_mtime, reverse=True
         ):
             if count >= max_results:
                 break
@@ -517,9 +548,9 @@ def search():
             except (subprocess.TimeoutExpired, Exception):
                 continue
 
-        # Search .log.gz files
+        # Search .log.gz files across all configured dirs
         for logfile in sorted(
-            LOG_DIR.glob("*.log.gz"), key=lambda p: p.stat().st_mtime, reverse=True
+            iter_log_files("*.log.gz"), key=lambda p: p.stat().st_mtime, reverse=True
         ):
             if count >= max_results:
                 break
@@ -658,8 +689,8 @@ def compress_old_logs():
     compressed = []
     skipped = []
 
-    if LOG_DIR.exists():
-        for logfile in sorted(LOG_DIR.glob("*.log")):
+    if any_log_dir_exists():
+        for logfile in sorted(iter_log_files("*.log")):
             if logfile.stat().st_mtime > cutoff:
                 continue
 
@@ -702,11 +733,25 @@ if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Claude Session Log Server")
     parser.add_argument("--host", default="0.0.0.0", help="Host to bind to")
     parser.add_argument("--port", type=int, default=8090, help="Port to listen on")
+    parser.add_argument(
+        "--dir",
+        action="append",
+        type=Path,
+        dest="dirs",
+        help="Log directory (repeatable; default: ~/claude-logs)",
+    )
     parser.add_argument("--debug", action="store_true", help="Enable debug mode")
 
     args = parser.parse_args()
 
+    if args.dirs:
+        # Mutate the module-level list in place so all helpers pick it up
+        LOG_DIRS.clear()
+        LOG_DIRS.extend(args.dirs)
+
     print(f"Starting Claude Log Server on http://{args.host}:{args.port}")
-    print(f"Log directory: {LOG_DIR}")
+    for d in LOG_DIRS:
+        marker = "✓" if d.exists() else "✗ (missing)"
+        print(f"Log directory: {d}  {marker}")
 
     app.run(host=args.host, port=args.port, debug=args.debug)
